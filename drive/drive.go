@@ -1,6 +1,7 @@
 package drive
 
 import (
+	"drivedlgo/customdec"
 	"drivedlgo/db"
 	"drivedlgo/utils"
 	"fmt"
@@ -10,45 +11,76 @@ import (
 	"os"
 	"path"
 	"sync"
+	"time"
 
-	"github.com/cheggaaa/pb"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
+
+	"github.com/vbauerster/mpb"
+	"github.com/vbauerster/mpb/decor"
 )
 
 var wg sync.WaitGroup
 
-func getProgressBar64(size int64) *pb.ProgressBar {
-	bar := pb.New64(size)
-	bar.ShowSpeed = true
-	bar.SetUnits(pb.U_BYTES)
-	return bar
-}
+const MAX_NAME_CHARACTERS int = 17
 
 type GoogleDriveClient struct {
 	GDRIVE_DIR_MIMETYPE string
 	TokenFile           string
 	CredentialFile      string
 	DriveSrv            *drive.Service
-	Concurrent          int
-	Tasks               int
-	isRunning           bool
-	ProgressBars        []*pb.ProgressBar
+	Progress            *mpb.Progress
+	channel             chan int
 }
 
 func (G *GoogleDriveClient) Init() {
 	G.GDRIVE_DIR_MIMETYPE = "application/vnd.google-apps.folder"
 	G.TokenFile = "token.json"
 	G.CredentialFile = "credentials.json"
-	G.Concurrent = 2
-	G.Tasks = 0
+	G.channel = make(chan int, 2)
+	G.Progress = mpb.New(mpb.WithWidth(60), mpb.WithRefreshRate(180*time.Millisecond))
 }
 
 func (G *GoogleDriveClient) SetConcurrency(count int) {
 	fmt.Printf("Using Concurrency: %d\n", count)
-	G.Concurrent = count
+	G.channel = make(chan int, count)
+}
+
+func (G *GoogleDriveClient) GetProgressBar(filename string, size int64) *mpb.Bar {
+	var bar *mpb.Bar
+	if len(filename) > MAX_NAME_CHARACTERS {
+		marquee := customdec.NewChangeNameDecor(filename, MAX_NAME_CHARACTERS)
+		bar = G.Progress.AddBar(size, mpb.BarStyle("[=>-|"),
+			mpb.PrependDecorators(
+				decor.Name("[ "),
+				marquee.MarqueeText(decor.WC{W: 5, C: decor.DidentRight}),
+				decor.Name(" ] "),
+				decor.CountersKibiByte("% .2f / % .2f"),
+			),
+			mpb.AppendDecorators(
+				decor.AverageETA(decor.ET_STYLE_GO),
+				decor.Name("]"),
+				decor.AverageSpeed(decor.UnitKiB, " % .2f"),
+			),
+		)
+	} else {
+		bar = G.Progress.AddBar(size, mpb.BarStyle("[=>-|"),
+			mpb.PrependDecorators(
+				decor.Name("[ "),
+				decor.Name(filename, decor.WC{W: 5, C: decor.DidentRight}),
+				decor.Name(" ] "),
+				decor.CountersKibiByte("% .2f / % .2f"),
+			),
+			mpb.AppendDecorators(
+				decor.AverageETA(decor.ET_STYLE_GO),
+				decor.Name("]"),
+				decor.AverageSpeed(decor.UnitKiB, " % .2f"),
+			),
+		)
+	}
+	return bar
 }
 
 func (G *GoogleDriveClient) getClient(config *oauth2.Config) *http.Client {
@@ -122,29 +154,6 @@ func (G *GoogleDriveClient) GetFilesByParentId(parentId string) []*drive.File {
 	return files
 }
 
-func (G *GoogleDriveClient) AddProgressBar(bar *pb.ProgressBar) {
-	G.ProgressBars = append(G.ProgressBars, bar)
-}
-
-func (G *GoogleDriveClient) SpinProgressBars() {
-	if !G.isRunning && len(G.ProgressBars) != 0 {
-		G.isRunning = true
-		pool, err := pb.StartPool(G.ProgressBars...)
-		if err != nil {
-			log.Fatal("[PoolError]: %v\n", err)
-		}
-		wg.Wait()
-		pool.Stop()
-		G.Clean()
-	}
-}
-
-func (G *GoogleDriveClient) Clean() {
-	G.ProgressBars = nil
-	G.Tasks = 0
-	G.isRunning = false
-}
-
 func (G *GoogleDriveClient) GetFileMetadata(fileId string) *drive.File {
 	file, err := G.DriveSrv.Files.Get(fileId).Fields("name,mimeType,size,id,md5Checksum").SupportsAllDrives(true).Do()
 	if err != nil {
@@ -172,14 +181,13 @@ func (G *GoogleDriveClient) Download(nodeId string, localPath string) {
 			return
 		}
 		if bytesDled != 0 {
-			log.Printf("Resuming %s at ByteOffset %d\n", file.Name, bytesDled)
+			fmt.Printf("Resuming %s at offset %d\n", file.Name, bytesDled)
 		}
-		bar := getProgressBar64(file.Size - bytesDled)
-		bar.Start()
+		G.channel <- 1
+		bar := G.GetProgressBar(file.Name, file.Size-bytesDled)
 		go G.DownloadFile(file, absPath, bar, bytesDled)
 		wg.Add(1)
 	}
-	G.SpinProgressBars()
 	wg.Wait()
 }
 
@@ -201,27 +209,21 @@ func (G *GoogleDriveClient) TraverseNodes(nodeId string, localPath string) {
 				continue
 			}
 			if exists {
-				log.Printf("%s already downloaded.\n", file.Name)
+				fmt.Printf("%s already downloaded.\n", file.Name)
 				continue
 			}
 			if bytesDled != 0 {
-				log.Printf("Resuming %s at ByteOffset %d\n", file.Name, bytesDled)
+				fmt.Printf("Resuming %s at offset %d\n", file.Name, bytesDled)
 			}
-			if G.Concurrent == G.Tasks {
-				G.SpinProgressBars()
-			}
-			bar := getProgressBar64(file.Size - bytesDled)
-			G.AddProgressBar(bar)
+			G.channel <- 1
+			bar := G.GetProgressBar(file.Name, file.Size-bytesDled)
 			go G.DownloadFile(file, absPath, bar, bytesDled)
 			wg.Add(1)
-			G.Tasks += 1
 		}
 	}
 }
 
-func (G *GoogleDriveClient) DownloadFile(file *drive.File, localPath string, bar *pb.ProgressBar, startByteIndex int64) bool {
-	defer wg.Done()
-	defer bar.Finish()
+func (G *GoogleDriveClient) DownloadFile(file *drive.File, localPath string, bar *mpb.Bar, startByteIndex int64) bool {
 	writer, err := os.OpenFile(localPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	writer.Seek(startByteIndex, 0)
 	request := G.DriveSrv.Files.Get(file.Id).SupportsAllDrives(true)
@@ -236,10 +238,12 @@ func (G *GoogleDriveClient) DownloadFile(file *drive.File, localPath string, bar
 		log.Printf("[FileOpenError]: %v\n", err)
 		return false
 	}
-
-	barReader := bar.NewProxyReader(response.Body)
-	io.Copy(writer, barReader)
+	proxyReader := bar.ProxyReader(response.Body)
+	io.Copy(writer, proxyReader)
 	writer.Close()
+	proxyReader.Close()
+	wg.Done()
+	<-G.channel
 	return true
 }
 

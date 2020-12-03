@@ -5,11 +5,12 @@ import (
 	"drivedlgo/drive"
 	"errors"
 	"fmt"
-	"github.com/urfave/cli"
 	"log"
 	"net/url"
 	"os"
 	"regexp"
+
+	"github.com/urfave/cli"
 )
 
 const DRIVE_LINK_REGEX string = `https://drive\.google\.com/(drive)?/?u?/?\d?/?(mobile)?/?(file)?(folders)?/?d?/([-\w]+)[?+]?/?(w+)?`
@@ -117,7 +118,7 @@ func main() {
 			Action: rmCredsCallback,
 		},
 	}
-	app.Version = "1.2"
+	app.Version = "1.4"
 	err := app.Run(os.Args)
 	if err != nil {
 		log.Fatal(err)
